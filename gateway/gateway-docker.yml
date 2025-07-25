@@ -1,0 +1,152 @@
+server:
+  servlet:
+    context-path: /api
+
+spring:
+  application:
+    name: gateway
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: http://keycloak:8585/auth/realms/srms # LOCAL DEV
+          jwk-set-uri: http://keycloak:8585/auth/realms/srms/protocol/openid-connect/certs # LOCAL DEV
+
+---
+
+spring:
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: true
+          lower-case-service-id: true
+          predicates:
+            - name: Path
+              args:
+                pattern: "'/'+serviceId.toLowerCase()+'/**'"
+          filters:
+            - name: RewritePath
+              args:
+                regexp: "'/' + serviceId.toLowerCase() + '/(?<remaining>.*)'"
+                replacement: "'/${remaining}'"
+      default-filters:
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 10
+            redis-rate-limiter.burstCapacity: 20
+            key-resolver: "#{@apiKeyResolver}"
+            status-code: 429
+            deny-empty-key: false
+        - name: CircuitBreaker
+          args:
+            name: default
+            fallbackUri: forward:/api/fallback/service-unavailable
+            statusCodes: INTERNAL_SERVER_ERROR, BAD_GATEWAY, SERVICE_UNAVAILABLE
+        - name: Retry
+          args:
+            retries: 3
+            statuses: BAD_GATEWAY, INTERNAL_SERVER_ERROR
+            methods: GET,POST
+            backoff:
+              firstBackoff: 10ms
+              maxBackoff: 1000ms
+              factor: 2
+        - name: AddRequestHeader
+          args:
+            name: Authorization
+            value: "Bearer { {jwt.token} }"
+        - name: AddRequestHeader
+          args:
+            name: X-Request-ID
+            value: "#{T(java.util.UUID).randomUUID().toString()}"
+      routes:
+        - id: customer-service
+          uri: lb://customer-service
+          predicates:
+            - Path=/customers/**
+          filters:
+            - StripPrefix=1
+            - name: MethodRole
+              args:
+                methods: [DELETE, PUT]
+                #paths: []
+                blockedRoles: [STAFF]
+                fallbackUri: forward:/api/fallback/access-denied
+
+    # Kubernetes discovery
+    kubernetes:
+      discovery:
+        namespaces: dev,lvoxx
+        enabled: true
+      reload:
+        enabled: true
+      config:
+        enabled: true
+        sources:
+          - name: ${spring.application.name}
+
+    # Redis configuration for rate limiting
+    redis:
+      host: redis
+      port: 6379
+
+    # Sleuth/Zipkin configuration
+    sleuth:
+      sampler:
+        probability: 1.0 # 100% sampling for demo
+    zipkin:
+      base-url: http://zipkin:9411 # LOCAL DEV
+
+---
+# Use for path matchers in SecurityConfig
+app:
+  cors:
+    allowed-origins: "*" # LOCAL DEV
+  access-rules:
+    public:
+      - /auth
+      - /auth/**
+      - /management
+      - /management/**
+      - /actuator
+      - /actuator/**
+      - /fallback
+      - /fallback/**
+    staff:
+      - /auth/**
+      - /customers/**
+    manager:
+      - /manager/**
+    admin:
+      - /admin/**
+
+---
+
+keycloak:
+  realm: srms
+  auth-server-url: http://srms:8585/auth # LOCAL DEV
+  ssl-required: external
+  resource: api-gateway
+  public-client: true
+  bearer-only: true
+  use-resource-role-mappings: true
+
+---
+
+# Actuator endpoints
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+      base-path: /management
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+    metrics:
+      enabled: true
+    prometheus:
+      enabled: true
